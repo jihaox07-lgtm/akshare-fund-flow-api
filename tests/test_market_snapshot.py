@@ -91,6 +91,33 @@ class MarketSnapshotNormalizationTests(unittest.TestCase):
         self.assertEqual(rows[0]["code"], "600000")
 
 
+class TencentMetricNormalizationTests(unittest.TestCase):
+    def test_parses_turnover_volume_ratio_and_source_time(self) -> None:
+        from tencent_metrics import parse_tencent_metrics
+
+        fields = [""] * 50
+        fields[1] = "示例股票"
+        fields[2] = "600000"
+        fields[30] = "20260923151720"
+        fields[38] = "3.25"
+        fields[49] = "1.68"
+        raw = f'v_sh600000="{"~".join(fields)}";'
+
+        self.assertEqual(parse_tencent_metrics(raw), [{
+            "code": "600000",
+            "turnover_rate": 3.25,
+            "volume_ratio": 1.68,
+            "source_updated_at": "2026-09-23T15:17:20+08:00",
+        }])
+
+    def test_sanitizes_codes_and_limits_batch_size(self) -> None:
+        from tencent_metrics import sanitize_codes
+
+        codes = ["600000", "300750", "600000", "bad", "123"]
+        self.assertEqual(sanitize_codes(codes), ["600000", "300750"])
+        self.assertEqual(len(sanitize_codes([f"{index:06d}" for index in range(150)])), 120)
+
+
 class MarketSnapshotCacheTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         import main

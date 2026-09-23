@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from market_snapshot import fetch_market_records
+from tencent_metrics import fetch_tencent_metrics, sanitize_codes
 
 
 @asynccontextmanager
@@ -153,7 +154,7 @@ def root() -> dict[str, Any]:
     return {
         "service": "A股板块资金流 API",
         "status": "ok",
-        "endpoints": ["/health", "/api/market-snapshot", "/api/industry-fund-flow", "/api/concept-fund-flow"],
+        "endpoints": ["/health", "/api/market-snapshot", "/api/stock-metrics", "/api/industry-fund-flow", "/api/concept-fund-flow"],
     }
 
 
@@ -168,6 +169,26 @@ async def market_snapshot() -> dict[str, Any]:
     return {
         "source": source,
         "updated_at": datetime.fromtimestamp(cached_at, timezone.utc).isoformat(),
+        "count": len(rows),
+        "data": rows,
+    }
+
+
+@app.get("/api/stock-metrics")
+async def stock_metrics(codes: str = Query(..., min_length=6, max_length=1000)) -> dict[str, Any]:
+    clean_codes = sanitize_codes(codes.split(","))
+    if not clean_codes:
+        raise HTTPException(status_code=400, detail="请提供有效的六位股票代码")
+    try:
+        rows = await asyncio.wait_for(
+            asyncio.to_thread(fetch_tencent_metrics, clean_codes),
+            timeout=7,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"腾讯公开行情暂不可用：{type(exc).__name__}") from exc
+    return {
+        "source": "腾讯公开行情（AKShare 服务代理）",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
         "count": len(rows),
         "data": rows,
     }
