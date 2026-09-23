@@ -18,6 +18,10 @@ async def lifespan(_: FastAPI):
     yield
     if not warmup.done():
         warmup.cancel()
+    await asyncio.gather(warmup, return_exceptions=True)
+    if market_refresh_task and not market_refresh_task.done():
+        market_refresh_task.cancel()
+        await asyncio.gather(market_refresh_task, return_exceptions=True)
 
 
 app = FastAPI(title="A股板块资金流 API", version="1.1.0", lifespan=lifespan)
@@ -31,9 +35,10 @@ app.add_middleware(
 
 CACHE_SECONDS = 60
 MARKET_CACHE_SECONDS = 600
+MARKET_REFRESH_TIMEOUT_SECONDS = 90
 cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 market_cache: tuple[float, str, list[dict[str, Any]]] | None = None
-market_lock = asyncio.Lock()
+market_refresh_task: asyncio.Task[tuple[float, str, list[dict[str, Any]]]] | None = None
 
 
 def clean_value(value: Any) -> Any:
@@ -93,22 +98,47 @@ def load_market_snapshot() -> tuple[str, list[dict[str, Any]]]:
     return fetch_market_records(providers)
 
 
-async def cached_market_snapshot() -> tuple[str, list[dict[str, Any]]]:
+async def refresh_market_snapshot() -> tuple[float, str, list[dict[str, Any]]]:
     global market_cache
+    try:
+        source, rows = await asyncio.to_thread(load_market_snapshot)
+    except Exception as exc:
+        if market_cache:
+            return market_cache
+        raise HTTPException(
+            status_code=502,
+            detail=f"全市场公开行情暂不可用：{type(exc).__name__}",
+        ) from exc
+    market_cache = (time.time(), source, rows)
+    return market_cache
+
+
+def start_market_refresh() -> asyncio.Task[tuple[float, str, list[dict[str, Any]]]]:
+    global market_refresh_task
+    if market_refresh_task is None or market_refresh_task.done():
+        market_refresh_task = asyncio.create_task(refresh_market_snapshot())
+
+        def consume_exception(task: asyncio.Task[Any]) -> None:
+            if not task.cancelled():
+                task.exception()
+
+        market_refresh_task.add_done_callback(consume_exception)
+    return market_refresh_task
+
+
+async def cached_market_snapshot() -> tuple[float, str, list[dict[str, Any]]]:
     if market_cache and time.time() - market_cache[0] < MARKET_CACHE_SECONDS:
-        return market_cache[1], market_cache[2]
-    async with market_lock:
-        if market_cache and time.time() - market_cache[0] < MARKET_CACHE_SECONDS:
-            return market_cache[1], market_cache[2]
-        try:
-            source, rows = await asyncio.wait_for(asyncio.to_thread(load_market_snapshot), timeout=90)
-        except Exception as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"全市场公开行情暂不可用：{type(exc).__name__}",
-            ) from exc
-        market_cache = (time.time(), source, rows)
-        return source, rows
+        return market_cache
+    refresh = start_market_refresh()
+    if market_cache:
+        return market_cache
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(refresh),
+            timeout=MARKET_REFRESH_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=502, detail="全市场公开行情首次加载超时") from exc
 
 
 async def warm_market_cache() -> None:
@@ -134,10 +164,10 @@ def health() -> dict[str, str]:
 
 @app.get("/api/market-snapshot")
 async def market_snapshot() -> dict[str, Any]:
-    source, rows = await cached_market_snapshot()
+    cached_at, source, rows = await cached_market_snapshot()
     return {
         "source": source,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.fromtimestamp(cached_at, timezone.utc).isoformat(),
         "count": len(rows),
         "data": rows,
     }
