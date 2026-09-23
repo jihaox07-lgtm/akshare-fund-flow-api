@@ -1,4 +1,6 @@
 import asyncio
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 import math
 import time
 from typing import Any, Callable
@@ -7,8 +9,18 @@ import akshare as ak
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
+from market_snapshot import fetch_market_records
 
-app = FastAPI(title="A股板块资金流 API", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    warmup = asyncio.create_task(warm_market_cache())
+    yield
+    if not warmup.done():
+        warmup.cancel()
+
+
+app = FastAPI(title="A股板块资金流 API", version="1.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,7 +30,10 @@ app.add_middleware(
 )
 
 CACHE_SECONDS = 60
+MARKET_CACHE_SECONDS = 600
 cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+market_cache: tuple[float, str, list[dict[str, Any]]] | None = None
+market_lock = asyncio.Lock()
 
 
 def clean_value(value: Any) -> Any:
@@ -61,18 +76,71 @@ async def cached_flow(kind: str, period: str) -> list[dict[str, Any]]:
     return rows
 
 
+def market_dataframe_records(fetcher: Callable[[], Any]) -> list[dict[str, Any]]:
+    frame = fetcher()
+    return frame.to_dict(orient="records")
+
+
+def load_market_snapshot() -> tuple[str, list[dict[str, Any]]]:
+    providers: list[tuple[str, Callable[[], list[dict[str, Any]]]]] = []
+    for source, function_name in (
+        ("AKShare / 新浪财经公开行情", "stock_zh_a_spot"),
+        ("AKShare / 东方财富公开行情", "stock_zh_a_spot_em"),
+    ):
+        fetcher = getattr(ak, function_name, None)
+        if callable(fetcher):
+            providers.append((source, lambda fetcher=fetcher: market_dataframe_records(fetcher)))
+    return fetch_market_records(providers)
+
+
+async def cached_market_snapshot() -> tuple[str, list[dict[str, Any]]]:
+    global market_cache
+    if market_cache and time.time() - market_cache[0] < MARKET_CACHE_SECONDS:
+        return market_cache[1], market_cache[2]
+    async with market_lock:
+        if market_cache and time.time() - market_cache[0] < MARKET_CACHE_SECONDS:
+            return market_cache[1], market_cache[2]
+        try:
+            source, rows = await asyncio.wait_for(asyncio.to_thread(load_market_snapshot), timeout=90)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"全市场公开行情暂不可用：{type(exc).__name__}",
+            ) from exc
+        market_cache = (time.time(), source, rows)
+        return source, rows
+
+
+async def warm_market_cache() -> None:
+    try:
+        await cached_market_snapshot()
+    except HTTPException:
+        return
+
+
 @app.get("/")
 def root() -> dict[str, Any]:
     return {
         "service": "A股板块资金流 API",
         "status": "ok",
-        "endpoints": ["/health", "/api/industry-fund-flow", "/api/concept-fund-flow"],
+        "endpoints": ["/health", "/api/market-snapshot", "/api/industry-fund-flow", "/api/concept-fund-flow"],
     }
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/market-snapshot")
+async def market_snapshot() -> dict[str, Any]:
+    source, rows = await cached_market_snapshot()
+    return {
+        "source": source,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "count": len(rows),
+        "data": rows,
+    }
 
 
 @app.get("/api/industry-fund-flow")
