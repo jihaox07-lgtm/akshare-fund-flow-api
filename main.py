@@ -1,6 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import math
 import time
 from typing import Any, Callable
@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from market_snapshot import fetch_market_records
+from risk_verification import RiskVerifier, parse_codes
 from tencent_metrics import fetch_tencent_metrics, sanitize_codes
 
 
@@ -40,6 +41,7 @@ MARKET_REFRESH_TIMEOUT_SECONDS = 90
 cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 market_cache: tuple[float, str, list[dict[str, Any]]] | None = None
 market_refresh_task: asyncio.Task[tuple[float, str, list[dict[str, Any]]]] | None = None
+risk_verifier = RiskVerifier()
 
 
 def clean_value(value: Any) -> Any:
@@ -154,7 +156,7 @@ def root() -> dict[str, Any]:
     return {
         "service": "A股板块资金流 API",
         "status": "ok",
-        "endpoints": ["/health", "/api/market-snapshot", "/api/stock-metrics", "/api/industry-fund-flow", "/api/concept-fund-flow"],
+        "endpoints": ["/health", "/api/market-snapshot", "/api/stock-metrics", "/api/stock-risk", "/api/industry-fund-flow", "/api/concept-fund-flow"],
     }
 
 
@@ -192,6 +194,31 @@ async def stock_metrics(codes: str = Query(..., min_length=6, max_length=1000)) 
         "count": len(rows),
         "data": rows,
     }
+
+
+@app.get("/api/stock-risk")
+async def stock_risk(
+    codes: str = Query(..., min_length=6, max_length=1000),
+    as_of: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+) -> dict[str, Any]:
+    try:
+        clean_codes = parse_codes(codes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        if len(as_of) != 10 or as_of[4] != "-" or as_of[7] != "-":
+            raise ValueError("invalid date shape")
+        trade_day = datetime.strptime(as_of, "%Y-%m-%d").date()
+        if trade_day.isoformat() != as_of:
+            raise ValueError("noncanonical date")
+        if trade_day < date(1990, 12, 19):
+            raise ValueError("before A-share trading history")
+        if trade_day > datetime.now(timezone(timedelta(hours=8))).date():
+            raise ValueError("future date")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="as_of 须为真实存在的 YYYY-MM-DD 日期") from exc
+    rows = await risk_verifier.verify(clean_codes, trade_day)
+    return {"as_of": as_of, "count": len(rows), "data": rows}
 
 
 @app.get("/api/industry-fund-flow")
