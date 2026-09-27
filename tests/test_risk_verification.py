@@ -1,7 +1,7 @@
 import asyncio
 from datetime import date
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import requests
 
@@ -375,6 +375,30 @@ class RiskRouteTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(row["checks"]), 5)
             self.assertTrue(all(item["state"] == "unknown" for item in row["checks"]))
             self.assertTrue(all("批量核验异常" in item["reason"] for item in row["checks"]))
+
+    async def test_route_recursively_sanitizes_non_finite_values(self):
+        import json
+        import main
+
+        report = {
+            "code": "600000",
+            "overall": "pending",
+            "checks": [
+                {
+                    "key": "unlock",
+                    "state": "unknown",
+                    "reason": "上游返回异常数值",
+                    "evidence": {"unlockRatio": float("nan"), "history": [float("inf")]},
+                }
+            ],
+        }
+        with patch.object(main.risk_verifier, "verify", new_callable=AsyncMock) as verify:
+            verify.return_value = [report]
+            payload = await main.stock_risk("600000", "2026-09-24")
+
+        self.assertIsNone(payload["data"][0]["checks"][0]["evidence"]["unlockRatio"])
+        self.assertIsNone(payload["data"][0]["checks"][0]["evidence"]["history"][0])
+        json.dumps(payload, allow_nan=False)
 
 
 if __name__ == "__main__":

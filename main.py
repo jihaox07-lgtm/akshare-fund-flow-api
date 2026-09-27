@@ -49,6 +49,12 @@ def clean_value(value: Any) -> Any:
         return None
     if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
         return None
+    if isinstance(value, dict):
+        return {str(key): clean_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [clean_value(item) for item in value]
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
     if hasattr(value, "item"):
         return clean_value(value.item())
     return value
@@ -223,6 +229,7 @@ async def stock_risk(
         # A single unexpected upstream/parser failure must not turn the whole
         # endpoint into a 500. Unknown is conservative; it never means pass.
         rows = unavailable_reports(clean_codes, trade_day, f"批量核验异常：{type(exc).__name__}；未通过任何风险检查")
+    rows = clean_value(rows)
     return {"as_of": as_of, "count": len(rows), "data": rows}
 
 
