@@ -361,6 +361,21 @@ class RiskRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(future_date.exception.status_code, 422)
         self.assertEqual(ancient_date.exception.status_code, 422)
 
+    async def test_route_degrades_batch_failure_to_five_unknown_checks_per_code(self):
+        import main
+
+        with patch.object(main, "risk_verifier") as verifier:
+            verifier.verify.side_effect = RuntimeError("unexpected batch failure")
+            payload = await main.stock_risk("600000,000001", "2026-09-24")
+
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual([row["code"] for row in payload["data"]], ["600000", "000001"])
+        for row in payload["data"]:
+            self.assertEqual(row["overall"], "pending")
+            self.assertEqual(len(row["checks"]), 5)
+            self.assertTrue(all(item["state"] == "unknown" for item in row["checks"]))
+            self.assertTrue(all("批量核验异常" in item["reason"] for item in row["checks"]))
+
 
 if __name__ == "__main__":
     unittest.main()

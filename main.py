@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from market_snapshot import fetch_market_records
-from risk_verification import RiskVerifier, parse_codes
+from risk_verification import RiskVerifier, parse_codes, unavailable_reports
 from tencent_metrics import fetch_tencent_metrics, sanitize_codes
 
 
@@ -217,7 +217,12 @@ async def stock_risk(
             raise ValueError("future date")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="as_of 须为真实存在的 YYYY-MM-DD 日期") from exc
-    rows = await risk_verifier.verify(clean_codes, trade_day)
+    try:
+        rows = await risk_verifier.verify(clean_codes, trade_day)
+    except Exception as exc:
+        # A single unexpected upstream/parser failure must not turn the whole
+        # endpoint into a 500. Unknown is conservative; it never means pass.
+        rows = unavailable_reports(clean_codes, trade_day, f"批量核验异常：{type(exc).__name__}；未通过任何风险检查")
     return {"as_of": as_of, "count": len(rows), "data": rows}
 
 

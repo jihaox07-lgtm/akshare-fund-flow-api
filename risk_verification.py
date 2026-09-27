@@ -64,6 +64,28 @@ def parse_codes(raw: str) -> list[str]:
     return codes
 
 
+def unavailable_reports(codes: list[str], as_of: date, reason: str) -> list[dict[str, Any]]:
+    """Return explicit unknown evidence when a whole verification batch fails."""
+    retrieved = datetime.now(timezone.utc).isoformat()
+    return [{
+        "code": code,
+        "asOf": as_of.isoformat(),
+        "windowEnd": None,
+        "overall": "pending",
+        "checks": [{
+            "id": check_id,
+            "state": "unknown",
+            "source": SOURCE_NAMES[check_id],
+            "sourceUrl": SOURCE_URLS[check_id],
+            "sourceUpdatedAt": None,
+            "retrievedAt": retrieved,
+            "reason": reason,
+        } for check_id in CHECK_IDS],
+        "unlockRatio": None,
+        "unlockRatioBasis": None,
+    } for code in codes]
+
+
 def _date(value: Any) -> date | None:
     if isinstance(value, datetime):
         return value.date()
